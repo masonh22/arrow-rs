@@ -461,6 +461,8 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             row_groups,
             projection: self.projection,
             selection: self.selection,
+            prefetch_row_groups: self.prefetch,
+            next_reader: None,
             schema,
             reader: Some(reader),
             state: StreamState::Init,
@@ -591,6 +593,8 @@ enum StreamState<T> {
     Init,
     /// Decoding a batch
     Decoding(ParquetRecordBatchReader),
+    /// Decoding a batch while fetching the next row group
+    Prefetch(ParquetRecordBatchReader, BoxFuture<'static, ReadResult<T>>),
     /// Reading data from input
     Reading(BoxFuture<'static, ReadResult<T>>),
     /// Error
@@ -602,6 +606,7 @@ impl<T> std::fmt::Debug for StreamState<T> {
         match self {
             StreamState::Init => write!(f, "StreamState::Init"),
             StreamState::Decoding(_) => write!(f, "StreamState::Decoding"),
+            StreamState::Prefetch(..) => write!(f, "StreamState::Prefetch"),
             StreamState::Reading(_) => write!(f, "StreamState::Reading"),
             StreamState::Error => write!(f, "StreamState::Error"),
         }
@@ -622,6 +627,11 @@ pub struct ParquetRecordBatchStream<T> {
     batch_size: usize,
 
     selection: Option<RowSelection>,
+
+    prefetch_row_groups: bool,
+
+    // TODO doc
+    next_reader: Option<ParquetRecordBatchReader>,
 
     /// This is an option so it can be moved into a future
     reader: Option<ReaderFactory<T>>,
@@ -649,6 +659,10 @@ impl<T> ParquetRecordBatchStream<T> {
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
+
+    // fn read_next_row_group(&mut self) -> BoxFuture<'static, ReadResult<T>> {
+        
+    // }
 }
 
 impl<T> Stream for ParquetRecordBatchStream<T>
@@ -660,17 +674,108 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match &mut self.state {
-                StreamState::Decoding(batch_reader) => match batch_reader.next() {
-                    Some(Ok(batch)) => {
-                        return Poll::Ready(Some(Ok(batch)));
+                StreamState::Decoding(batch_reader) => {
+                    let res: Self::Item;
+                    match batch_reader.next() {
+                        Some(Ok(batch)) => {
+                            res = Ok(batch);
+                        }
+                        Some(Err(e)) => {
+                            self.state = StreamState::Error;
+                            return Poll::Ready(Some(Err(ParquetError::ArrowError(e.to_string()))));
+                        }
+                        None => {
+                            self.state = StreamState::Init;
+                            continue
+                        }
                     }
-                    Some(Err(e)) => {
-                        self.state = StreamState::Error;
-                        return Poll::Ready(Some(Err(ParquetError::ArrowError(e.to_string()))));
+
+                    if !self.prefetch_row_groups
+                        || self.row_groups.is_empty()
+                        || self.next_reader.is_some()
+                    {
+                        return Poll::Ready(Some(res))
                     }
-                    None => self.state = StreamState::Init,
+
+                    let old_state = std::mem::replace(&mut self.state, StreamState::Init);
+
+                    if let Some(row_group_idx) = self.row_groups.pop_front() {
+                        // TODO factor this out!
+                        let reader = self.reader.take().expect("lost reader");
+
+                        let row_count = self.metadata.row_group(row_group_idx).num_rows() as usize;
+
+                        let selection = self.selection.as_mut().map(|s| s.split_off(row_count));
+
+                        let fut = reader
+                            .read_row_group(
+                                row_group_idx,
+                                selection,
+                                self.projection.clone(),
+                                self.batch_size,
+                            )
+                            .boxed();
+
+                        if let StreamState::Decoding(batch_reader) = old_state {
+                            self.state = StreamState::Prefetch(batch_reader, fut);
+                            return Poll::Ready(Some(res))
+                        } else {
+                            unreachable!()
+                        }
+                    }
+
+                    self.state = old_state;
+
+                    return Poll::Ready(Some(res))
+                },
+                StreamState::Prefetch(batch_reader, f) => {
+                    // TODO is this weird/bad to call this here? messes with cx?
+                    match f.poll_unpin(cx) {
+                        Poll::Pending => (),
+                        Poll::Ready(Ok((reader_factory, maybe_reader))) => {
+                            let old_state = std::mem::replace(&mut self.state, StreamState::Init);
+                            if let StreamState::Prefetch(batch_reader, _) = old_state {
+                                self.state = StreamState::Decoding(batch_reader);
+                            } else {
+                                unreachable!()
+                            }
+                            self.reader = Some(reader_factory);
+                            self.next_reader = maybe_reader;
+                            continue
+                        },
+                        Poll::Ready(Err(e)) => {
+                            // TODO return the error right away or defer it?
+                            self.state = StreamState::Error;
+                            return Poll::Ready(Some(Err(e)))
+                        },
+                    }
+
+                    // TODO factor this out!
+                    match batch_reader.next() {
+                        Some(Ok(batch)) => {
+                            return Poll::Ready(Some(Ok(batch)))
+                        }
+                        Some(Err(e)) => {
+                            self.state = StreamState::Error;
+                            return Poll::Ready(Some(Err(ParquetError::ArrowError(e.to_string()))));
+                        }
+                        None => {
+                            let old_state = std::mem::replace(&mut self.state, StreamState::Init);
+                            if let StreamState::Prefetch(_, f) = old_state {
+                                self.state = StreamState::Reading(f);
+                                return Poll::Pending
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                    }
                 },
                 StreamState::Init => {
+                    if let Some(batch_reader) = self.next_reader.take() {
+                        self.state = StreamState::Decoding(batch_reader);
+                        continue
+                    }
+
                     let row_group_idx = match self.row_groups.pop_front() {
                         Some(idx) => idx,
                         None => return Poll::Ready(None),
