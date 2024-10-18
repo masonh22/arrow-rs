@@ -413,6 +413,17 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         Ok(Some(Sbbf::new(&bitset)))
     }
 
+    /// For async readers, load data for the next row group while decoding the
+    /// current row group.
+    ///
+    /// Defaults to `false`
+    pub fn with_prefetch(self, prefetch: bool) -> Self {
+        Self {
+            prefetch,
+            ..self
+        }
+    }
+
     /// Build a new [`ParquetRecordBatchStream`]
     pub fn build(self) -> Result<ParquetRecordBatchStream<T>> {
         let num_row_groups = self.metadata.row_groups().len();
@@ -593,7 +604,7 @@ enum StreamState<T> {
     Init,
     /// Decoding a batch
     Decoding(ParquetRecordBatchReader),
-    /// Decoding a batch while fetching the next row group
+    /// Decoding a batch while fetching another row group
     Prefetch(ParquetRecordBatchReader, BoxFuture<'static, ReadResult<T>>),
     /// Reading data from input
     Reading(BoxFuture<'static, ReadResult<T>>),
@@ -630,7 +641,7 @@ pub struct ParquetRecordBatchStream<T> {
 
     prefetch_row_groups: bool,
 
-    // TODO doc
+    /// The next row group to decode if we are prefetching.
     next_reader: Option<ParquetRecordBatchReader>,
 
     /// This is an option so it can be moved into a future
@@ -659,10 +670,31 @@ impl<T> ParquetRecordBatchStream<T> {
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
+}
 
-    // fn read_next_row_group(&mut self) -> BoxFuture<'static, ReadResult<T>> {
-        
-    // }
+impl<T> ParquetRecordBatchStream<T>
+where
+    T: AsyncFileReader + 'static,
+{
+    /// Returns a future for reading row group `row_group_idx`.
+    ///
+    /// Note: this function should only be called in [`StreamState::Init`] and
+    /// [`StreamState::Decoding`] as this takes [`ParquetRecordBatchStream::reader`]
+    /// and panics if it does not exist.
+    fn read_row_group(&mut self, row_group_idx: usize) -> BoxFuture<'static, ReadResult<T>> {
+        let reader = self.reader.take().expect("lost reader");
+
+        let row_count = self.metadata.row_group(row_group_idx).num_rows() as usize;
+
+        let selection = self.selection.as_mut().map(|s| s.split_off(row_count));
+
+        reader.read_row_group(
+            row_group_idx,
+            selection,
+            self.projection.clone(),
+            self.batch_size,
+        ).boxed()
+    }
 }
 
 impl<T> Stream for ParquetRecordBatchStream<T>
@@ -699,38 +731,25 @@ where
 
                     let old_state = std::mem::replace(&mut self.state, StreamState::Init);
 
-                    if let Some(row_group_idx) = self.row_groups.pop_front() {
-                        // TODO factor this out!
-                        let reader = self.reader.take().expect("lost reader");
+                    let row_group_idx = self
+                        .row_groups
+                        .pop_front()
+                        .unwrap(); // already checked that row_groups is not empty
 
-                        let row_count = self.metadata.row_group(row_group_idx).num_rows() as usize;
+                    let fut = self.read_row_group(row_group_idx);
 
-                        let selection = self.selection.as_mut().map(|s| s.split_off(row_count));
-
-                        let fut = reader
-                            .read_row_group(
-                                row_group_idx,
-                                selection,
-                                self.projection.clone(),
-                                self.batch_size,
-                            )
-                            .boxed();
-
-                        if let StreamState::Decoding(batch_reader) = old_state {
-                            self.state = StreamState::Prefetch(batch_reader, fut);
-                            return Poll::Ready(Some(res))
-                        } else {
-                            unreachable!()
-                        }
+                    if let StreamState::Decoding(batch_reader) = old_state {
+                        self.state = StreamState::Prefetch(batch_reader, fut);
+                        return Poll::Ready(Some(res))
+                    } else {
+                        unreachable!()
                     }
-
-                    self.state = old_state;
-
-                    return Poll::Ready(Some(res))
                 },
                 StreamState::Prefetch(batch_reader, f) => {
-                    // TODO is this weird/bad to call this here? messes with cx?
-                    match f.poll_unpin(cx) {
+                    let mut noop_cx = Context::from_waker(
+                        futures::task::noop_waker_ref()
+                    );
+                    match f.poll_unpin(&mut noop_cx) {
                         Poll::Pending => (),
                         Poll::Ready(Ok((reader_factory, maybe_reader))) => {
                             let old_state = std::mem::replace(&mut self.state, StreamState::Init);
@@ -744,13 +763,11 @@ where
                             continue
                         },
                         Poll::Ready(Err(e)) => {
-                            // TODO return the error right away or defer it?
                             self.state = StreamState::Error;
                             return Poll::Ready(Some(Err(e)))
                         },
                     }
 
-                    // TODO factor this out!
                     match batch_reader.next() {
                         Some(Ok(batch)) => {
                             return Poll::Ready(Some(Ok(batch)))
@@ -781,20 +798,7 @@ where
                         None => return Poll::Ready(None),
                     };
 
-                    let reader = self.reader.take().expect("lost reader");
-
-                    let row_count = self.metadata.row_group(row_group_idx).num_rows() as usize;
-
-                    let selection = self.selection.as_mut().map(|s| s.split_off(row_count));
-
-                    let fut = reader
-                        .read_row_group(
-                            row_group_idx,
-                            selection,
-                            self.projection.clone(),
-                            self.batch_size,
-                        )
-                        .boxed();
+                    let fut = self.read_row_group(row_group_idx);
 
                     self.state = StreamState::Reading(fut)
                 }
@@ -2141,5 +2145,96 @@ mod tests {
 
         // Should only have made 3 requests
         assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_reader_prefetch() {let a = StringArray::from_iter_values(["a", "b", "b", "b", "c", "c"]);
+        let b = StringArray::from_iter_values(["1", "2", "3", "4", "5", "6"]);
+        let c = Int32Array::from_iter(0..6);
+        let data = RecordBatch::try_from_iter([
+            ("a", Arc::new(a) as ArrayRef),
+            ("b", Arc::new(b) as ArrayRef),
+            ("c", Arc::new(c) as ArrayRef),
+        ])
+        .unwrap();
+
+        let mut buf = Vec::with_capacity(1024);
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(3)
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut buf, data.schema(), Some(props)).unwrap();
+        writer.write(&data).unwrap();
+        writer.close().unwrap();
+
+        let data: Bytes = buf.into();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
+
+        assert_eq!(metadata.num_row_groups(), 2);
+
+        let test = TestReader {
+            data,
+            metadata: Arc::new(metadata),
+            requests: Default::default(),
+        };
+
+        let mut stream = ParquetRecordBatchStreamBuilder::new(test.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1)
+            .with_limit(5)
+            .with_prefetch(true)
+            .build()
+            .unwrap();
+
+        let batch1 = stream.try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        // Each batch should only have one row
+        assert_eq!(batch1.num_rows(), 1);
+        // Make sure we are pre-fetching
+        assert!(matches!(stream.state, StreamState::Prefetch(..)));
+
+        let batch2 = stream.try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch2.num_rows(), 1);
+        // We should no longer be prefetching...
+        assert!(matches!(stream.state, StreamState::Decoding(..)));
+        // because we already fetched the next row group.
+        assert!(stream.next_reader.is_some());
+
+        let batch3 = stream.try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch3.num_rows(), 1);
+        assert!(matches!(stream.state, StreamState::Decoding(..)));
+        assert!(stream.next_reader.is_some());
+
+        let batch4 = stream.try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch4.num_rows(), 1);
+        assert!(matches!(stream.state, StreamState::Decoding(..)));
+        assert!(stream.next_reader.is_none());
+
+        let batch5 = stream.try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch5.num_rows(), 1);
+        assert!(matches!(stream.state, StreamState::Decoding(..)));
+        assert!(stream.next_reader.is_none());
+
+        let batch6 = stream.try_next()
+            .await
+            .unwrap();
+        assert!(batch6.is_none());
+        assert!(stream.next_reader.is_none());
     }
 }

@@ -241,17 +241,6 @@ impl<T> ArrowReaderBuilder<T> {
             ..self
         }
     }
-
-    /// For async readers, load data for the next row group while decoding the
-    /// current row group.
-    ///
-    /// Defaults to `false`
-    pub fn with_prefetch(self, prefetch: bool) -> Self {
-        Self {
-            prefetch,
-            ..self
-        }
-    }
 }
 
 /// Options that control how metadata is read for a parquet file
